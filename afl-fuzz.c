@@ -87,6 +87,16 @@ static u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
+static u8 schedule = 0;               /* Power schedule (default: FAST)   */
+enum {
+  /* 00 */ FAST,                      /* Exponential schedule             */
+  /* 01 */ COE,                       /* Cut-Off Exponential schedule     */
+  /* 02 */ EXPLORE,                   /* Exploration-based constant sch.  */
+  /* 03 */ LIN,                       /* Linear schedule                  */
+  /* 04 */ QUAD,                      /* Quadratic schedule               */
+  /* 05 */ EXPLOIT                    /* AFL's exploitation-based const.  */
+};
+
 static u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
            use_splicing,              /* Recombine input files?           */
@@ -239,7 +249,8 @@ struct queue_entry {
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */
-      depth;                          /* Path depth                       */
+      depth,                          /* Path depth                       */
+      n_fuzz;                         /* Number of fuzz */
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
@@ -318,6 +329,7 @@ enum {
   /* 05 */ FAULT_NOBITS
 };
 
+static u64 next_p2(u64 val);
 
 /* Get unix time in milliseconds */
 
@@ -808,6 +820,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->len          = len;
   q->depth        = cur_depth + 1;
   q->passed_det   = passed_det;
+  q->n_fuzz       = 1;
 
   if (q->depth > max_depth) max_depth = (u32)(q->depth);
 
@@ -1271,6 +1284,7 @@ static void minimize_bits(u8* dst, u8* src) {
 static void update_bitmap_score(struct queue_entry* q) {
 
   u32 i;
+  u64 fuzz_p2      = next_p2 (q->n_fuzz);
   u64 fav_factor = q->exec_us * q->len;
 
   /* For every byte set in trace_bits[], see if there is a previous winner,
@@ -1282,9 +1296,17 @@ static void update_bitmap_score(struct queue_entry* q) {
 
        if (top_rated[i]) {
 
-         /* Faster-executing or smaller test cases are favored. */
+         u64 top_rated_fuzz_p2    = next_p2 (top_rated[i]->n_fuzz);
+         u64 top_rated_fav_factor = top_rated[i]->exec_us * top_rated[i]->len;
 
-         if (fav_factor > top_rated[i]->exec_us * top_rated[i]->len) continue;
+         if (fuzz_p2 > top_rated_fuzz_p2) continue;
+         else if (fuzz_p2 == top_rated_fuzz_p2) {
+
+           /* Faster-executing or smaller test cases are favored. */
+
+           if (fav_factor > top_rated_fav_factor) continue;
+
+         }
 
          /* Looks like we're going to win. Decrease ref count for the
             previous winner, discard its trace_bits[] if necessary. */
@@ -3149,6 +3171,18 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
   s32 fd;
   u8  keeping = 0, res;
 
+  /* Update path frequency. */
+  u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+  struct queue_entry* q = queue;
+  while (q) {
+    if (q->exec_cksum == cksum)
+      q->n_fuzz = q->n_fuzz + 1;
+
+    q = q->next;
+
+  }
+
   if (fault == crash_mode) {
 
     /* Keep only if there are new bits in the map, add to queue for
@@ -4429,9 +4463,9 @@ static void show_init_stats(void) {
 
 /* Find first power of two greater or equal to val. */
 
-static u32 next_p2(u32 val) {
+static u64 next_p2(u64 val) {
 
-  u32 ret = 1;
+  u64 ret = 1;
   while (val > ret) ret <<= 1;
   return ret;
 
@@ -4719,9 +4753,71 @@ static u32 calculate_score(struct queue_entry* q) {
 	  else perf_score *= 5;
   }
 
+
+  u64 fuzz = q->n_fuzz;
+  u64 fuzz_total;
+
+  u32 n_paths, fuzz_mu;
+  u32 factor = 1;
+
+  switch (schedule) {
+
+    case EXPLORE: 
+      break;
+
+    case EXPLOIT:
+      factor = MAX_FACTOR;
+      break;
+
+    case COE:
+      fuzz_total = 0;
+      n_paths = 0;
+
+      struct queue_entry *queue_it = queue;	
+      while (queue_it) {
+        fuzz_total += queue_it->n_fuzz;
+        n_paths ++;
+        queue_it = queue_it->next;
+      }
+
+      fuzz_mu = fuzz_total / n_paths;
+      if (fuzz <= fuzz_mu) {
+        if (q->fuzz_level < 16)
+          factor = ((u32) (1 << q->fuzz_level));
+        else 
+          factor = MAX_FACTOR;
+      } else {
+        factor = 0;
+      }
+      break;
+    
+    case FAST:
+      if (q->fuzz_level < 16) {
+         factor = ((u32) (1 << q->fuzz_level)) / (fuzz == 0 ? 1 : fuzz); 
+      } else
+        factor = MAX_FACTOR / (fuzz == 0 ? 1 : next_p2 (fuzz));
+      break;
+
+    case LIN:
+      factor = q->fuzz_level / (fuzz == 0 ? 1 : fuzz); 
+      break;
+
+    case QUAD:
+      factor = q->fuzz_level * q->fuzz_level / (fuzz == 0 ? 1 : fuzz);
+      break;
+
+    default:
+      PFATAL ("Unkown Power Schedule");
+  }
+  if (factor > MAX_FACTOR) 
+    factor = MAX_FACTOR;
+
+  perf_score *= factor / POWER_BETA;
+
   /* Make sure that we don't go over limit. */
 
   if (perf_score > HAVOC_MAX_MULT * 100) perf_score = HAVOC_MAX_MULT * 100;
+  if (perf_score < 10) perf_score = 10;
 
   return perf_score;
 
@@ -6856,7 +6952,8 @@ static void usage(u8* argv0) {
         "  -Y            - enable the static instrumentation mode\n\n"
 
        "Execution control settings:\n\n"
-
+       "  -p schedule   - power schedules recompute a seed's performance score.\n"
+       "                  <fast (default), coe, explore, lin, quad, or exploit>\n"
        "  -f file       - location read by the fuzzed program (stdin)\n"
  
        "Fuzzing behavior settings:\n\n"
@@ -7500,6 +7597,7 @@ int main(int argc, char** argv) {
 #endif
 
   SAYF("WinAFL " WINAFL_VERSION " by <ifratric@google.com>\n");
+  SAYF("Extended with power schedules by <marcel.boehme@acm.org>\n");
   SAYF("Based on AFL " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
 
   doc_path = "docs";
@@ -7511,7 +7609,7 @@ int main(int argc, char** argv) {
   dynamorio_dir = NULL;
   client_params = NULL;
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dYnCB:S:M:x:QD:b:p:")) > 0)
 
     switch (opt) {
 
@@ -7688,6 +7786,22 @@ int main(int argc, char** argv) {
 
         break;
 
+      case 'p': /* Power schedule */
+        if (!stricmp(optarg, "fast")) {
+          schedule = FAST;
+        } else if (!stricmp(optarg, "coe")) {
+          schedule = COE;
+        } else if (!stricmp(optarg, "exploit")) {
+          schedule = EXPLOIT;
+        } else if (!stricmp(optarg, "lin")) {
+          schedule = LIN;
+        } else if (!stricmp(optarg, "quad")) {
+          schedule = QUAD;
+        } else if (!stricmp(optarg, "explore")) {
+          schedule = EXPLORE;
+        }
+        break;
+
       default:
 
         usage(argv[0]);
@@ -7706,6 +7820,16 @@ int main(int argc, char** argv) {
 
   if (!strcmp(in_dir, out_dir))
     FATAL("Input and output directories can't be the same");
+
+  switch (schedule) {
+    case FAST:    OKF ("Using exponential power schedule (FAST)"); break;
+    case COE:     OKF ("Using cut-off exponential power schedule (COE)"); break;
+    case EXPLOIT: OKF ("Using exploitation-based constant power schedule (EXPLOIT)"); break;
+    case LIN:     OKF ("Using linear power schedule (LIN)"); break;
+    case QUAD:    OKF ("Using quadratic power schedule (QUAD)"); break;
+    case EXPLORE: OKF ("Using exploration-based constant power schedule (EXPLORE)"); break;
+    default : FATAL ("Unkown power schedule"); break;
+  }
 
   if (dumb_mode) {
 
