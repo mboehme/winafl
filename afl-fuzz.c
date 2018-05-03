@@ -245,6 +245,7 @@ struct queue_entry {
       fs_redundant;                   /* Marked as redundant in the fs?   */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
+      fuzz_level,                     /* Number of fuzzing iterations     */
       exec_cksum;                     /* Checksum of the execution trace  */
 
   u64 exec_us,                        /* Execution time (us)              */
@@ -6682,6 +6683,8 @@ abandon_entry:
     pending_not_fuzzed--;
     if (queue_cur->favored) pending_favored--;
   }
+
+  queue_cur->fuzz_level++;
 
   if (in_buf != orig_in) ck_free(in_buf);
   ck_free(orig_in);
